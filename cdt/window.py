@@ -1,6 +1,6 @@
 """Active window detection.
 
-Four back-ends are implemented so the client works on practically every Linux
+Five back-ends are implemented so the client works on practically every Linux
 desktop:
 
 ``x11``
@@ -11,12 +11,12 @@ desktop:
     ``swaymsg -t get_tree`` on Sway/wlroots compositors.
 ``hyprland``
     ``hyprctl -j activewindow`` on Hyprland.
+``atspi``
+    The AT-SPI accessibility bus, which GNOME on Wayland always exposes:
+    the focused window is tracked through accessibility focus and
+    window-activation events.
 ``external``
     Any user supplied command emitting ``{"app_id": ..., "app_name": ...}``.
-
-GNOME on Wayland does not expose the focused window to clients, so the client
-detects that situation and reports it through ``cdt doctor`` instead of
-silently uploading bogus data.
 """
 
 from __future__ import annotations
@@ -28,10 +28,14 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from dataclasses import replace
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .apps import prettify_app_name
+from .dbus import DBusConnection, DBusError
 from .models import WindowInfo
 
 # X11 constants ---------------------------------------------------------------
@@ -485,6 +489,339 @@ class HyprlandWindowSource(WindowSource):
 
 
 # --------------------------------------------------------------------------- #
+# GNOME / AT-SPI (accessibility bus)
+# --------------------------------------------------------------------------- #
+
+class AtspiWindowSource(WindowSource):
+    """Active window via the AT-SPI accessibility bus (GNOME on Wayland).
+
+    GNOME on Wayland does not expose the focused window to plain Wayland
+    clients, but it does expose it through the accessibility bus that
+    screen readers use: focused widgets announce themselves with a
+    ``StateChanged`` signal and every toplevel window carries an
+    ``active`` state while it is the active window.  The source listens
+    for those events and falls back to a one-time walk of the
+    accessibility tree, so the very first poll already knows the answer.
+    """
+
+    name = "atspi"
+    kind = "wayland"
+    label = "AT-SPI (GNOME accessibility bus)"
+
+    _BUS_SERVICE = "org.a11y.Bus"
+    _BUS_PATH = "/org/a11y/bus"
+    _REGISTRY_SERVICE = "org.a11y.atspi.Registry"
+    _REGISTRY_PATH = "/org/a11y/atspi/registry"
+    _ROOT_PATH = "/org/a11y/atspi/accessible/root"
+    _ACCESSIBLE_IFACE = "org.a11y.atspi.Accessible"
+    _PROPERTIES_IFACE = "org.freedesktop.DBus.Properties"
+    _SESSION_BUS = "org.freedesktop.DBus"
+    _SESSION_PATH = "/org/freedesktop/DBus"
+    _NULL_PATH = "/org/a11y/atspi/null"
+
+    # roles that represent a toplevel window
+    _ROLE_ALERT = 2
+    _ROLE_DIALOG = 16
+    _ROLE_FRAME = 23
+    _ROLE_INTERNAL_FRAME = 28
+    _ROLE_WINDOW = 69
+    _WINDOW_ROLES = frozenset(
+        (_ROLE_ALERT, _ROLE_DIALOG, _ROLE_FRAME, _ROLE_INTERNAL_FRAME,
+         _ROLE_WINDOW)
+    )
+    _ROLE_APPLICATION = 75
+
+    _STATE_ACTIVE = 1
+    _STATE_FOCUSED = 12
+
+    _MAX_CLIMB = 16
+    _MAX_DEPTH = 4
+    _MAX_NODES = 400
+    #: How long to wait before re-walking the tree after a walk
+    #: that found nothing focused (the desktop is empty).
+    _EMPTY_RETRY_SECONDS = 5.0
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._focus_ref: Optional[Tuple[str, str]] = None
+        self._active_ref: Optional[Tuple[str, str]] = None
+        self._window_ref: Optional[Tuple[str, str]] = None
+        self._window: Optional[WindowInfo] = None
+        self._dirty = True
+        self._last_empty_resolve: float = 0.0
+        self._walk_budget = 0
+
+        try:
+            session = DBusConnection.session()
+        except DBusError as error:
+            raise OSError(f"no D-Bus session bus: {error}") from error
+        try:
+            (address,) = session.call(
+                self._BUS_SERVICE, self._BUS_PATH, self._BUS_SERVICE,
+                "GetAddress", "", (),
+            )
+        except DBusError as error:
+            session.close()
+            raise OSError(
+                "the AT-SPI accessibility bus is not running "
+                "(is at-spi2-core installed?)"
+            ) from error
+        self._session = session
+        try:
+            self._bus = DBusConnection.connect(str(address))
+            # fail fast when the registry daemon is not answering
+            self._bus.call(
+                self._REGISTRY_SERVICE, self._REGISTRY_PATH,
+                self._REGISTRY_SERVICE, "GetRegisteredEvents", "", (),
+            )
+        except DBusError as error:
+            session.close()
+            raise OSError(
+                "the AT-SPI registry is not answering: "
+                f"{error.name} {error.message}"
+            ) from error
+        self._bus.add_match(
+            "type='signal',interface='org.a11y.atspi.Event.Object',"
+            "member='StateChanged'"
+        )
+        self._bus.add_match(
+            "type='signal',interface='org.a11y.atspi.Event.Focus',"
+            "member='Focus'"
+        )
+        self._bus.add_signal_handler(self._on_signal)
+
+    def is_available(self) -> bool:
+        return True
+
+    # -- events -------------------------------------------------------------
+    def _on_signal(
+        self, interface: str, member: str, path: str, sender: str,
+        body: Tuple[Any, ...],
+    ) -> None:
+        if (
+            interface == "org.a11y.atspi.Event.Object"
+            and member == "StateChanged"
+        ):
+            state = body[0] if body else ""
+            enabled = body[1] if len(body) > 1 else 0
+            if state == "focused" and enabled:
+                with self._lock:
+                    self._focus_ref = (sender, path)
+                    self._dirty = True
+            elif state == "active" and enabled:
+                with self._lock:
+                    self._active_ref = (sender, path)
+                    self._dirty = True
+        elif (
+            interface == "org.a11y.atspi.Event.Focus"
+            and member == "Focus"
+        ):
+            # deprecated but still emitted by some toolkits
+            with self._lock:
+                self._focus_ref = (sender, path)
+                self._dirty = True
+
+    # -- D-Bus helpers ------------------------------------------------------
+    def _call(
+        self, ref: Tuple[str, str], member: str,
+        signature: str = "", args: Sequence[Any] = (),
+    ) -> Tuple[Any, ...]:
+        bus_name, path = ref
+        return self._bus.call(
+            bus_name, path, self._ACCESSIBLE_IFACE, member,
+            signature, args, timeout=5.0,
+        )
+
+    def _property(self, ref: Tuple[str, str], name: str) -> Any:
+        bus_name, path = ref
+        (value,) = self._bus.call(
+            bus_name, path, self._PROPERTIES_IFACE, "Get", "ss",
+            (self._ACCESSIBLE_IFACE, name), timeout=5.0,
+        )
+        return value
+
+    def _role(self, ref: Tuple[str, str]) -> int:
+        (role,) = self._call(ref, "GetRole")
+        return int(role)
+
+    def _states(self, ref: Tuple[str, str]) -> List[int]:
+        (states,) = self._call(ref, "GetState")
+        return [int(state) for state in states]
+
+    def _parent(self, ref: Tuple[str, str]) -> Tuple[str, str]:
+        # the Parent property is itself a (so) object reference
+        parent = self._property(ref, "Parent")
+        return (str(parent[0]), str(parent[1]))
+
+    def _children(self, ref: Tuple[str, str]) -> List[Tuple[str, str]]:
+        (children,) = self._call(ref, "GetChildren")
+        return [(str(bus_name), str(path)) for bus_name, path in children]
+
+    def _application(self, ref: Tuple[str, str]) -> Optional[Tuple[str, str]]:
+        (app,) = self._call(ref, "GetApplication")
+        bus_name, path = app
+        if not bus_name or path == self._NULL_PATH:
+            return None
+        return (bus_name, path)
+
+    def _pid(self, bus_name: str) -> Optional[int]:
+        try:
+            (pid,) = self._bus.call(
+                self._SESSION_BUS, self._SESSION_PATH, self._SESSION_BUS,
+                "GetConnectionUnixProcessID", "s", (bus_name,),
+            )
+        except DBusError:
+            return None
+        return int(pid)
+
+    # -- resolution ---------------------------------------------------------
+    def _climb_to_window(self, ref: Tuple[str, str]) -> Optional[Tuple[str, str]]:
+        """Walk up from a focused widget to its toplevel window."""
+        for _ in range(self._MAX_CLIMB):
+            try:
+                role = self._role(ref)
+            except DBusError:
+                return None
+            if role in self._WINDOW_ROLES:
+                return ref
+            if role == self._ROLE_APPLICATION:
+                return None
+            bus_name, path = self._parent(ref)
+            if not bus_name or path == self._NULL_PATH:
+                return None
+            ref = (bus_name, path)
+        return None
+
+    def _walk(self) -> Optional[Tuple[str, str]]:
+        """Scan the accessibility tree for the active window."""
+        root = (self._REGISTRY_SERVICE, self._ROOT_PATH)
+        self._walk_budget = self._MAX_NODES
+        for app_ref in self._children(root):
+            try:
+                if self._role(app_ref) != self._ROLE_APPLICATION:
+                    continue
+                for window_ref in self._children(app_ref):
+                    if self._role(window_ref) not in self._WINDOW_ROLES:
+                        continue
+                    if self._STATE_ACTIVE in self._states(window_ref):
+                        return window_ref
+                    if self._has_focused_descendant(window_ref):
+                        return window_ref
+                    if not self._spend():
+                        return None
+            except DBusError:
+                continue
+        return None
+
+    def _spend(self) -> bool:
+        """Use one unit of the tree-walk budget."""
+        self._walk_budget -= 1
+        return self._walk_budget > 0
+
+    def _has_focused_descendant(self, ref: Tuple[str, str]) -> bool:
+        level = self._children(ref)
+        for _ in range(self._MAX_DEPTH):
+            if not level:
+                return False
+            next_level: List[Tuple[str, str]] = []
+            for child in level:
+                if not self._spend():
+                    return False
+                if self._STATE_FOCUSED in self._states(child):
+                    return True
+                next_level.extend(self._children(child))
+            level = next_level
+        return False
+
+    def _resolve(self) -> Optional[Tuple[str, str]]:
+        with self._lock:
+            focus_ref = self._focus_ref
+            active_ref = self._active_ref
+        if focus_ref is not None:
+            window = self._climb_to_window(focus_ref)
+            if window is not None:
+                return window
+        if active_ref is not None:
+            try:
+                if self._role(active_ref) in self._WINDOW_ROLES:
+                    return active_ref
+            except DBusError:
+                pass
+        return self._walk()
+
+    def _describe(self, ref: Tuple[str, str]) -> Optional[WindowInfo]:
+        try:
+            title = str(self._property(ref, "Name") or "")
+            app_ref = self._application(ref)
+        except DBusError:
+            return None
+        app_name = ""
+        pid: Optional[int] = None
+        if app_ref is not None:
+            try:
+                app_name = str(self._property(app_ref, "Name") or "")
+            except DBusError:
+                app_name = ""
+            pid = self._pid(app_ref[0])
+        app_id = app_name.strip().lower() or f"window-{ref[1]}"
+        return WindowInfo(
+            app_id=app_id,
+            app_name=prettify_app_name(app_id, fallback=app_name),
+            title=title,
+            pid=pid,
+            source=self.name,
+        )
+
+    # -- public API ---------------------------------------------------------
+    def get_active_window(self) -> Optional[WindowInfo]:
+        with self._lock:
+            dirty = self._dirty
+            ref = self._window_ref
+            last_empty = self._last_empty_resolve
+
+        if dirty or ref is None:
+            # a walk that found nothing focused (empty desktop)
+            # is only retried every few seconds
+            if (
+                ref is None
+                and not dirty
+                and time.monotonic() - last_empty < self._EMPTY_RETRY_SECONDS
+            ):
+                return None
+            resolved = self._resolve()
+            info = self._describe(resolved) if resolved else None
+            with self._lock:
+                self._window_ref = resolved
+                self._window = info
+                self._dirty = False
+                if info is None:
+                    self._last_empty_resolve = time.monotonic()
+            return info
+
+        # refresh the title: it changes without a focus event
+        # (browser tabs, editors, ...)
+        try:
+            title = str(self._property(ref, "Name") or "")
+        except DBusError:
+            with self._lock:
+                self._dirty = True
+            return None
+        with self._lock:
+            cached = self._window
+        if cached is None:
+            return None
+        if cached.title != title:
+            cached = replace(cached, title=title)
+            with self._lock:
+                self._window = cached
+        return cached
+
+    def close(self) -> None:
+        self._bus.close()
+        self._session.close()
+
+
+# --------------------------------------------------------------------------- #
 # User supplied command
 # --------------------------------------------------------------------------- #
 
@@ -596,10 +933,26 @@ _SOURCES = {
     "xprop": XpropWindowSource,
     "sway": SwayWindowSource,
     "hyprland": HyprlandWindowSource,
+    "atspi": AtspiWindowSource,
     "none": NullWindowSource,
 }
 
-_AUTO_ORDER = ("x11", "sway", "hyprland", "xprop")
+_X11_ORDER = ("x11", "sway", "hyprland", "xprop")
+_WAYLAND_ORDER = ("atspi", "sway", "hyprland")
+
+
+def _is_wayland_session() -> bool:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    return os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland"
+
+
+def _auto_order() -> Sequence[str]:
+    if _is_wayland_session():
+        # X11 queries only reach XWayland windows on a Wayland session,
+        # so the accessibility bus and the native Wayland sources go first.
+        return _WAYLAND_ORDER
+    return _X11_ORDER
 
 
 def open_window_source(preference: str = "auto", external_command: str = "") -> WindowSource:
@@ -621,7 +974,7 @@ def open_window_source(preference: str = "auto", external_command: str = "") -> 
     if preference in _SOURCES:
         candidates: Iterable[type] = [_SOURCES[preference]]
     elif preference in ("auto", ""):
-        candidates = [_SOURCES[name] for name in _AUTO_ORDER]
+        candidates = [_SOURCES[name] for name in _auto_order()]
     else:
         raise OSError(
             f"unknown window source '{preference}' "
@@ -646,8 +999,9 @@ def open_window_source(preference: str = "auto", external_command: str = "") -> 
     raise OSError(
         "no usable active-window source found"
         + (f" ({'; '.join(failures)})" if failures else "")
-        + ". Install libx11 (or x11-utils), or run on Sway/Hyprland, "
-        "or set settings.external_window_command."
+        + ". On GNOME Wayland install at-spi2-core, otherwise install "
+        "libx11 (or x11-utils), run on Sway/Hyprland, or set "
+        "settings.external_window_command."
     )
 
 
@@ -670,7 +1024,7 @@ def describe_environment() -> Dict[str, Any]:
     detected: List[str] = []
     notes: List[str] = []
 
-    for name in _AUTO_ORDER:
+    for name in _auto_order():
         if _probe(_SOURCES[name]) is not None:
             detected.append(name)
 
@@ -679,16 +1033,17 @@ def describe_environment() -> Dict[str, Any]:
         session = "Sway"
     elif os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
         session = "Hyprland"
-    elif os.environ.get("WAYLAND_DISPLAY"):
+    elif _is_wayland_session():
         session = "Wayland"
 
-    if session == "Wayland":
+    if _is_wayland_session() and "atspi" not in detected:
         notes.append(
-            "GNOME/KDE Wayland sessions do not expose the focused window to "
-            "clients; per-app tracking is unavailable there (idle time is still "
-            "recorded). Use X11, Sway, Hyprland or settings.external_window_command."
+            "No AT-SPI accessibility bus found - GNOME Wayland sessions "
+            "need at-spi2-core (and at-spi2-atk for GTK apps) for per-app "
+            "tracking. Idle time is still recorded, or use "
+            "settings.external_window_command."
         )
-    if not os.environ.get("DISPLAY") and session != "X11":
+    if not os.environ.get("DISPLAY") and not _is_wayland_session():
         notes.append("No DISPLAY/WAYLAND_DISPLAY found - is this a desktop session?")
 
     return {

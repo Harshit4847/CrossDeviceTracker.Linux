@@ -212,7 +212,7 @@ class Settings:
     platform: str = "Linux"
 
     # tracking -------------------------------------------------------------
-    window_source: str = "auto"  # auto | x11 | xprop | sway | hyprland | external | none
+    window_source: str = "auto"  # auto | x11 | xprop | sway | hyprland | atspi | external | none
     idle_source: str = "auto"  # auto | xss | xprintidle | mutter | none
     external_window_command: str = ""
     poll_interval_seconds: float = 1.0

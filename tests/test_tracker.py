@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import List, Optional, Sequence
 
 from cdt.idle import ScriptedIdleSource
-from cdt.models import WindowInfo
+from cdt.models import UsageSession, WindowInfo
 from cdt.queue import PendingLogQueue
 from cdt.tracker import TrackerOptions, UsageTracker
-from cdt.window import ScriptedWindowSource
+from cdt.window import AtspiWindowSource, ScriptedWindowSource
+
+from .fake_dbus import FakeDBusDaemon, STATE_ACTIVE
 
 BASE = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
 
@@ -277,6 +281,96 @@ class DescribeTest(TrackerFixture):
         tracker.window_source = Broken()
         tracker.tick(now=at(0))
         self.assertIn("display gone", tracker.stats.last_error or "")
+
+
+class AtspiEndToEndTest(unittest.TestCase):
+    """Focus events from a fake AT-SPI bus become queued sessions."""
+
+    def setUp(self):
+        self.daemon = FakeDBusDaemon()
+        self._old_address = os.environ.get("DBUS_SESSION_BUS_ADDRESS")
+        os.environ["DBUS_SESSION_BUS_ADDRESS"] = self.daemon.address
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.queue = PendingLogQueue(Path(self.tmp.name) / "queue.db")
+        self.addCleanup(self.queue.close)
+        self.firefox = self.daemon.add_app(":1.42", 4321, "Firefox")
+        self.firefox_window = self.firefox.add_window(
+            "Inbox - Gmail", states=[STATE_ACTIVE]
+        )
+        self.terminal = self.daemon.add_app(":1.43", 5332, "org.gnome.Terminal")
+        self.terminal_window = self.terminal.add_window("bash - 80x24")
+        self.addCleanup(self._restore)
+
+    def _restore(self):
+        if self._old_address is None:
+            os.environ.pop("DBUS_SESSION_BUS_ADDRESS", None)
+        else:
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = self._old_address
+        self.daemon.close()
+
+    def _wait_for_switch(self, source: AtspiWindowSource) -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with source._lock:
+                if source._dirty:
+                    return
+            time.sleep(0.05)
+        self.fail("the focus event never arrived")
+
+    def test_focus_events_become_queued_sessions(self):
+        source = AtspiWindowSource()
+        self.addCleanup(source.close)
+        seen: List[UsageSession] = []
+        tracker = UsageTracker(
+            window_source=source,
+            idle_source=ScriptedIdleSource([0]),
+            queue=self.queue,
+            options=TrackerOptions(
+                poll_interval_seconds=0.2, min_session_seconds=1
+            ),
+            on_session=seen.append,
+        )
+        self.addCleanup(tracker.close)
+
+        base = datetime(2026, 10, 19, 10, 0, 0, tzinfo=timezone.utc)
+
+        def at(seconds: float) -> datetime:
+            return base + timedelta(seconds=seconds)
+
+        # the initial tree walk finds the active Firefox window
+        self.assertEqual(source.get_active_window().app_id, "firefox")
+
+        tracker.tick(now=at(0))
+        tracker.tick(now=at(1))
+
+        # the user switches to the terminal
+        self.daemon.emit_state_changed(
+            ":1.43", self.terminal_window.path, "active", True
+        )
+        self._wait_for_switch(source)
+        tracker.tick(now=at(5))
+        tracker.tick(now=at(6))
+        tracker.close()
+
+        # full session details (pid, title, source) come from the
+        # tracker's session callback
+        self.assertEqual([session.app_name for session in seen],
+                         ["Firefox", "Terminal"])
+        self.assertEqual(seen[0].package_name, "firefox")
+        self.assertEqual(seen[0].duration_seconds, 5)
+        self.assertEqual(seen[0].pid, 4321)
+        self.assertEqual(seen[0].window_title, "Inbox - Gmail")
+        self.assertEqual(seen[0].source, "atspi")
+        self.assertEqual(seen[1].package_name, "org.gnome.terminal")
+        self.assertEqual(seen[1].duration_seconds, 1)
+        self.assertEqual(seen[1].pid, 5332)
+        self.assertEqual(seen[1].window_title, "bash - 80x24")
+
+        # and the queue holds the same sessions for uploading
+        queued = self.queue.peek(limit=10)
+        self.assertEqual([entry.app_name for entry in queued],
+                         ["Firefox", "Terminal"])
 
 
 if __name__ == "__main__":
