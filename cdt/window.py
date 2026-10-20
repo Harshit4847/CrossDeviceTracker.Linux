@@ -645,8 +645,15 @@ class AtspiWindowSource(WindowSource):
         return int(role)
 
     def _states(self, ref: Tuple[str, str]) -> List[int]:
+        # GetState returns a bitset: each 32-bit word holds 32 state
+        # flags, so state N is set when word N//32 has bit N%32.
         (states,) = self._call(ref, "GetState")
-        return [int(state) for state in states]
+        words = [int(state) for state in states]
+        return [
+            index
+            for index in range(len(words) * 32)
+            if words[index // 32] & (1 << (index % 32))
+        ]
 
     def _parent(self, ref: Tuple[str, str]) -> Tuple[str, str]:
         # the Parent property is itself a (so) object reference

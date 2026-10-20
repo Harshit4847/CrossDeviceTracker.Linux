@@ -388,7 +388,14 @@ class FakeDBusDaemon:
         if member == "GetRoleName":
             return ("s", (f"role-{accessible.role}",))
         if member == "GetState":
-            return ("au", (accessible.states,))
+            # The real bus packs state flags into 32-bit words: state N
+            # is set when word N//32 has bit N%32.  Tests keep using
+            # human-readable state IDs in ``accessible.states``; pack
+            # them here so the wire format matches at-spi2-core.
+            words = [0] * (max(accessible.states, default=0) // 32 + 1)
+            for state in accessible.states:
+                words[state // 32] |= 1 << (state % 32)
+            return ("au", (words,))
         if member == "GetApplication":
             return ("(so)", (accessible.application,))
         if member == "GetAttributes":

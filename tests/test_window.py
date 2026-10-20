@@ -224,6 +224,25 @@ class AtspiWindowSourceTest(AtspiFixture):
         self.assertEqual(window.pid, 4321)
         self.assertEqual(window.source, "atspi")
 
+    def test_states_decodes_the_packed_bitset(self):
+        # Regression guard: GetState returns bit-packed 32-bit
+        # words, not a list of state IDs.  ACTIVE is bit 1 and
+        # FOCUSED is bit 12, so both fit in a single word.
+        packed = self.firefox.add_window(
+            "packed", states=[STATE_ACTIVE, STATE_FOCUSED]
+        )
+        self.assertEqual(
+            self.source._states((":1.42", packed.path)),
+            [STATE_ACTIVE, STATE_FOCUSED],
+        )
+
+    def test_states_decodes_flags_across_multiple_words(self):
+        # State IDs >= 32 live in the second word of the bitset.
+        wide = self.firefox.add_window("wide", states=[STATE_ACTIVE, 40])
+        self.assertEqual(
+            self.source._states((":1.42", wide.path)), [STATE_ACTIVE, 40]
+        )
+
     def test_an_active_state_event_switches_the_window(self):
         self.daemon.emit_state_changed(
             ":1.42", self.firefox_window.path, "active", False
