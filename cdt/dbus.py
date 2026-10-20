@@ -548,7 +548,7 @@ class DBusConnection:
     def _authenticate(self) -> None:
         # SASL EXTERNAL: the kernel credentials prove the uid
         self._socket.sendall(b"\x00")
-        self._socket.sendall(f"AUTH EXTERNAL {os.getuid():x}\r\n".encode())
+        self._socket.sendall(f"AUTH EXTERNAL {str(os.getuid()).encode().hex()}\r\n".encode())
         line = self._read_line()
         if line.startswith("REJECTED"):
             self._socket.sendall(b"AUTH ANONYMOUS\r\n")
