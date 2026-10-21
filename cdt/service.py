@@ -54,13 +54,28 @@ def resolve_exec_command() -> Dict[str, Any]:
     ]
     for candidate in candidates:
         if candidate and Path(candidate).exists() and os.access(candidate, os.X_OK):
-            return {"argv": [str(candidate), "start"], "env": {}}
+            return {"argv": [str(candidate), "start"], "env": _desktop_environment()}
 
     package_parent = str(Path(__file__).resolve().parent.parent)
     return {
         "argv": [sys.executable, "-m", "cdt", "start"],
-        "env": {"PYTHONPATH": package_parent, "PYTHONUNBUFFERED": "1"},
+        "env": {"PYTHONPATH": package_parent, "PYTHONUNBUFFERED": "1", **_desktop_environment()},
     }
+
+
+def _desktop_environment() -> Dict[str, str]:
+    """Carry the current graphical-session buses into the user service."""
+    names = (
+        "DBUS_SESSION_BUS_ADDRESS",
+        "AT_SPI_BUS_ADDRESS",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_CURRENT_DESKTOP",
+        "XDG_SESSION_DESKTOP",
+        "XDG_SESSION_TYPE",
+        "XDG_RUNTIME_DIR",
+    )
+    return {name: os.environ[name] for name in names if os.environ.get(name)}
 
 
 def _unit_contents(exec_argv: List[str], env: Dict[str, str], api_url: str) -> str:
@@ -68,12 +83,12 @@ def _unit_contents(exec_argv: List[str], env: Dict[str, str], api_url: str) -> s
         "[Unit]",
         f"Description={APP_NAME} Linux client - screen time tracking",
         "After=default.target",
-        # Only start when a graphical session is actually available (X11 or
-        # Wayland) - otherwise the tracker has nothing to observe.
-        'ExecCondition=/bin/sh -c \'test -n "${DISPLAY}${WAYLAND_DISPLAY}"\'',
         "",
         "[Service]",
         "Type=simple",
+        # Only start when a graphical session is actually available (X11 or
+        # Wayland) - otherwise the tracker has nothing to observe.
+        'ExecCondition=/bin/sh -c \'test -n "${DISPLAY}${WAYLAND_DISPLAY}"\'',
         f"ExecStart={' '.join(exec_argv)}",
         "Restart=on-failure",
         "RestartSec=15",

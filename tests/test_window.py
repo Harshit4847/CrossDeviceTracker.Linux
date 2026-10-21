@@ -23,9 +23,11 @@ from cdt.models import WindowInfo
 from cdt.window import (
     AtspiWindowSource,
     ExternalWindowSource,
+    HyprlandWindowSource,
     NullWindowSource,
     ScriptedWindowSource,
     WindowSource,
+    _probe,
     describe_environment,
     open_window_source,
 )
@@ -165,6 +167,20 @@ class EnvironmentDescriptionTest(unittest.TestCase):
             self.assertIn(key, described)
         self.assertIsInstance(described["availableSources"], list)
         self.assertIn("systemctl", described["tools"])
+
+    def test_probe_closes_a_successful_temporary_source(self):
+        source = mock.Mock()
+        source.is_available.return_value = True
+        probed, failure = _probe(lambda: source)
+        self.assertIs(probed, source)
+        self.assertIsNone(failure)
+        source.close.assert_called_once_with()
+
+    def test_hyprland_requires_the_compositor_signature(self):
+        with mock.patch.dict(os.environ, {"WAYLAND_DISPLAY": "wayland-0"}, clear=False):
+            os.environ.pop("HYPRLAND_INSTANCE_SIGNATURE", None)
+            with mock.patch("cdt.window.shutil.which", return_value="/usr/bin/hyprctl"):
+                self.assertFalse(HyprlandWindowSource().is_available())
 
 
 class AtspiFixture(unittest.TestCase):
