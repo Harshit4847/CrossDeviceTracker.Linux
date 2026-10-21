@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 from cdt.dbus import (
     DBusConnection,
@@ -42,6 +43,7 @@ class MarshallingTest(unittest.TestCase):
             ("a(si)", [[("x", 1), ("y", 2)]]),
             ("", []),
         ]
+
         for signature, values in cases:
             with self.subTest(signature=signature):
                 data = marshal_body(signature, values)
@@ -67,6 +69,17 @@ class MarshallingTest(unittest.TestCase):
     def test_malformed_signature_is_an_error(self):
         with self.assertRaises(DBusError):
             marshal_body("(", ())
+
+
+class AuthenticationTest(unittest.TestCase):
+    def test_external_identity_is_hex_encoded_ascii_uid(self):
+        connection = DBusConnection.__new__(DBusConnection)
+        connection._socket = mock.Mock()
+        connection._read_line = mock.Mock(return_value="OK guid")
+        with mock.patch("cdt.dbus.os.getuid", return_value=1000):
+            connection._authenticate()
+        connection._socket.sendall.assert_any_call(b"AUTH EXTERNAL 31303030\r\n")
+        connection._socket.sendall.assert_called_with(b"BEGIN\r\n")
 
 
 try:  # dbus-next is only used as an independent oracle, never at runtime

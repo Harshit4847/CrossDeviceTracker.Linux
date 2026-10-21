@@ -550,9 +550,6 @@ class DBusConnection:
         self._socket.sendall(b"\x00")
         self._socket.sendall(f"AUTH EXTERNAL {str(os.getuid()).encode().hex()}\r\n".encode())
         line = self._read_line()
-        if line.startswith("REJECTED"):
-            self._socket.sendall(b"AUTH ANONYMOUS\r\n")
-            line = self._read_line()
         if not line.startswith("OK"):
             raise DBusError(
                 "org.freedesktop.DBus.Error.AccessDenied",

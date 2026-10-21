@@ -461,7 +461,7 @@ class HyprlandWindowSource(WindowSource):
     label = "Hyprland (hyprctl)"
 
     def is_available(self) -> bool:
-        if not (os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") or os.environ.get("WAYLAND_DISPLAY")):
+        if not os.environ.get("HYPRLAND_INSTANCE_SIGNATURE"):
             return False
         return shutil.which("hyprctl") is not None
 
@@ -1012,18 +1012,21 @@ def open_window_source(preference: str = "auto", external_command: str = "") -> 
     )
 
 
-def _probe(cls: type) -> Optional[WindowSource]:
-    """Instantiate a source, returning ``None`` when it is not usable here."""
+def _probe(cls: type) -> Tuple[Optional[WindowSource], Optional[str]]:
+    """Probe a source and return its diagnostic failure, if any."""
     try:
         instance = cls()
-    except Exception:  # OSError and anything a missing library can raise
-        return None
+    except Exception as error:  # OSError and anything a missing library can raise
+        return None, str(error)
     try:
         if not instance.is_available():
-            return None
-    except Exception:  # pragma: no cover - defensive
-        return None
-    return instance
+            instance.close()
+            return None, None
+    except Exception as error:  # pragma: no cover - defensive
+        instance.close()
+        return None, str(error)
+    instance.close()
+    return instance, None
 
 
 def describe_environment() -> Dict[str, Any]:
@@ -1032,8 +1035,11 @@ def describe_environment() -> Dict[str, Any]:
     notes: List[str] = []
 
     for name in _auto_order():
-        if _probe(_SOURCES[name]) is not None:
+        source, failure = _probe(_SOURCES[name])
+        if source is not None:
             detected.append(name)
+        elif failure:
+            notes.append(f"{name} probe failed: {failure}")
 
     session = "X11" if os.environ.get("DISPLAY") else ""
     if os.environ.get("SWAYSOCK"):
@@ -1043,7 +1049,9 @@ def describe_environment() -> Dict[str, Any]:
     elif _is_wayland_session():
         session = "Wayland"
 
-    if _is_wayland_session() and "atspi" not in detected:
+    if _is_wayland_session() and "atspi" not in detected and not any(
+        note.startswith("atspi probe failed:") for note in notes
+    ):
         notes.append(
             "No AT-SPI accessibility bus found - GNOME Wayland sessions "
             "need at-spi2-core (and at-spi2-atk for GTK apps) for per-app "
